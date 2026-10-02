@@ -126,7 +126,11 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, reset-first
+  # reset-first prefers the credential whose weekly quota window resets soonest (Claude unified
+  # 7d reset, Codex secondary reset), so usage burns the weekly allowance that is refunded first.
+  # Short 5h exhaustion is handled by the normal cooldown and fails over to the next credential.
+  # Credentials without an observed upcoming reset are tried last, in ID order.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
