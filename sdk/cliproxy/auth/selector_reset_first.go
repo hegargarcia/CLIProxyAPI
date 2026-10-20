@@ -10,20 +10,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// ResetFirstSelector prefers the credential whose weekly quota window resets soonest.
-//
-// The goal is to burn as much of each weekly allowance as possible: usage spent on a
-// credential whose week is about to roll over is "refunded" first, so it is drained ahead
-// of credentials with a distant weekly reset. Short-window (5h) exhaustion is not part of
-// the ordering; it is handled by the normal cooldown, which makes the credential
-// unavailable until its 5h reset so requests fail over to the next credential meanwhile.
-// The reset time comes from the passive quota snapshot recorded on each credential from
-// upstream response headers (see QuotaState.Signals). Credentials with no usable signal,
-// or whose last observed reset has already passed, sort after every credential with a
-// known upcoming reset. Ties and unknowns fall back to ID order so the result stays
-// deterministic.
-//
-// Like FillFirstSelector it only ever picks within the highest available priority tier.
 type ResetFirstSelector struct{}
 
 // Pick selects the available auth with the earliest upcoming quota reset.
@@ -44,65 +30,80 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 	return ordered[0], nil
 }
 
-// orderByQuotaReset returns a copy of auths sorted by upcoming reset time (soonest first),
-// with unknown or elapsed resets last and ID as the final tiebreaker.
+type quotaResetWindows struct {
+	fiveHour time.Time
+	weekly   time.Time
+}
+
 func orderByQuotaReset(auths []*Auth, now time.Time) []*Auth {
 	ordered := append([]*Auth(nil), auths...)
-	resets := make(map[string]time.Time, len(ordered))
+	resets := make(map[string]quotaResetWindows, len(ordered))
 	for _, auth := range ordered {
-		if auth == nil {
-			continue
-		}
-		if resetAt, ok := quotaResetAt(auth, now); ok {
-			resets[auth.ID] = resetAt
+		if auth != nil {
+			resets[auth.ID] = quotaResetsAt(auth, now)
 		}
 	}
 	sort.SliceStable(ordered, func(i, j int) bool {
 		left, right := ordered[i], ordered[j]
-		leftReset, leftKnown := resets[left.ID]
-		rightReset, rightKnown := resets[right.ID]
-		switch {
-		case leftKnown && !rightKnown:
-			return true
-		case !leftKnown && rightKnown:
-			return false
-		case leftKnown && rightKnown && !leftReset.Equal(rightReset):
-			return leftReset.Before(rightReset)
-		default:
-			return left.ID < right.ID
+		leftReset, rightReset := resets[left.ID], resets[right.ID]
+		if order := compareQuotaReset(leftReset.fiveHour, rightReset.fiveHour); order != 0 {
+			return order < 0
 		}
+		if order := compareQuotaReset(leftReset.weekly, rightReset.weekly); order != 0 {
+			return order < 0
+		}
+		return left.ID < right.ID
 	})
 	return ordered
 }
 
-// quotaResetAt extracts the upcoming weekly-window reset for a credential from its
-// observed quota signals. It reports false when no signal is present, the value cannot
-// be parsed, or the reset is not in the future.
-func quotaResetAt(auth *Auth, now time.Time) (time.Time, bool) {
+func compareQuotaReset(left, right time.Time) int {
+	switch {
+	case left.IsZero() && right.IsZero():
+		return 0
+	case left.IsZero():
+		return 1
+	case right.IsZero():
+		return -1
+	default:
+		return left.Compare(right)
+	}
+}
+
+func quotaResetsAt(auth *Auth, now time.Time) quotaResetWindows {
 	if auth == nil || len(auth.Quota.Signals) == 0 {
-		return time.Time{}, false
+		return quotaResetWindows{}
 	}
 	signals := auth.Quota.Signals
-	var resetAt time.Time
-	var ok bool
+	var resets quotaResetWindows
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "claude":
-		// Anthropic's unified 7d window is the weekly allowance.
-		resetAt, ok = parseQuotaResetTimestamp(signals["Anthropic-Ratelimit-Unified-7d-Reset"])
+		resets.fiveHour, _ = parseQuotaResetTimestamp(signals["Anthropic-Ratelimit-Unified-5h-Reset"])
+		resets.weekly, _ = parseQuotaResetTimestamp(signals["Anthropic-Ratelimit-Unified-7d-Reset"])
 	case "codex":
-		// Codex's secondary window is the weekly one (primary is 5h). Reset-At is
-		// absolute, Reset-After-Seconds is relative to when the snapshot was observed.
-		resetAt, ok = parseQuotaResetTimestamp(signals["X-Codex-Secondary-Reset-At"])
-		if !ok && !auth.Quota.ObservedAt.IsZero() {
-			if seconds, errParse := strconv.ParseInt(strings.TrimSpace(signals["X-Codex-Secondary-Reset-After-Seconds"]), 10, 64); errParse == nil && seconds >= 0 {
-				resetAt, ok = auth.Quota.ObservedAt.Add(time.Duration(seconds)*time.Second), true
-			}
+		resets.fiveHour = codexQuotaResetAt(auth.Quota, "Primary")
+		resets.weekly = codexQuotaResetAt(auth.Quota, "Secondary")
+	}
+	if !resets.fiveHour.After(now) {
+		resets.fiveHour = time.Time{}
+	}
+	if !resets.weekly.After(now) {
+		resets.weekly = time.Time{}
+	}
+	return resets
+}
+
+func codexQuotaResetAt(quota QuotaState, window string) time.Time {
+	prefix := "X-Codex-" + window
+	if resetAt, ok := parseQuotaResetTimestamp(quota.Signals[prefix+"-Reset-At"]); ok {
+		return resetAt
+	}
+	if !quota.ObservedAt.IsZero() {
+		if seconds, errParse := strconv.ParseInt(strings.TrimSpace(quota.Signals[prefix+"-Reset-After-Seconds"]), 10, 64); errParse == nil && seconds >= 0 {
+			return quota.ObservedAt.Add(time.Duration(seconds) * time.Second)
 		}
 	}
-	if !ok || !resetAt.After(now) {
-		return time.Time{}, false
-	}
-	return resetAt, true
+	return time.Time{}
 }
 
 // parseQuotaResetTimestamp accepts unix seconds (optionally fractional), unix milliseconds,
@@ -129,18 +130,21 @@ func parseQuotaResetTimestamp(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// describeQuotaResetOrder renders the sorted candidates as "id(reset in 1h2m3s), id(unknown)".
 func describeQuotaResetOrder(ordered []*Auth, now time.Time) string {
 	parts := make([]string, 0, len(ordered))
 	for _, auth := range ordered {
 		if auth == nil {
 			continue
 		}
-		if resetAt, ok := quotaResetAt(auth, now); ok {
-			parts = append(parts, auth.ID+"(reset in "+resetAt.Sub(now).Truncate(time.Second).String()+")")
-			continue
-		}
-		parts = append(parts, auth.ID+"(unknown)")
+		resets := quotaResetsAt(auth, now)
+		parts = append(parts, auth.ID+"(5h="+describeQuotaReset(resets.fiveHour, now)+", weekly="+describeQuotaReset(resets.weekly, now)+")")
 	}
 	return strings.Join(parts, ", ")
+}
+
+func describeQuotaReset(resetAt, now time.Time) string {
+	if resetAt.IsZero() {
+		return "unknown"
+	}
+	return "reset in " + resetAt.Sub(now).Truncate(time.Second).String()
 }
