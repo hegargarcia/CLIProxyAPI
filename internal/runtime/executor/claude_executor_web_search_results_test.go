@@ -9,12 +9,12 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 const claudeWebSearchExecutorResults = `[{"type":"web_search_result","url":"https://example.com/a","title":"A","encrypted_content":"enc-a","page_age":null},{"type":"web_search_result","url":"https://example.com/b","title":"B","encrypted_content":"enc-b","page_age":null}]`
@@ -42,7 +42,7 @@ func claudeWebSearchUpstream(t *testing.T, bodies *[][]byte, mu *sync.Mutex) htt
 				`{"type":"text","text":"found two pages"}`,
 			}
 		}
-		if !gjson.GetBytes(body, "stream").Bool() {
+		if !ojson.GetBytes(body, "stream").Bool() {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"msg_ws","type":"message","role":"assistant","model":"claude-opus-5-5","content":[` + strings.Join(blocks, ",") + `],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":5}}`))
 			return
@@ -58,7 +58,7 @@ func claudeWebSearchUpstream(t *testing.T, bodies *[][]byte, mu *sync.Mutex) htt
 			}
 			events = append(events, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":"+index+",\"content_block\":"+start+"}")
 			if strings.Contains(block, `"type":"text"`) {
-				events = append(events, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":"+index+",\"delta\":{\"type\":\"text_delta\",\"text\":"+gjson.Get(block, "text").Raw+"}}")
+				events = append(events, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":"+index+",\"delta\":{\"type\":\"text_delta\",\"text\":"+ojson.Get(block, "text").Raw+"}}")
 			}
 			events = append(events, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":"+index+"}")
 		}
@@ -74,6 +74,7 @@ func claudeWebSearchUpstream(t *testing.T, bodies *[][]byte, mu *sync.Mutex) htt
 type claudeWebSearchExecutorRun struct {
 	sessionID string
 	input     string
+	auth      *cliproxyauth.Auth
 }
 
 func runClaudeWebSearchScenario(t *testing.T, cfg *config.Config, stream bool, runs []claudeWebSearchExecutorRun) [][]byte {
@@ -88,12 +89,26 @@ func runClaudeWebSearchScenario(t *testing.T, cfg *config.Config, stream bool, r
 	defer server.Close()
 
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-web-search", "base_url": server.URL}}
+	defaultAuth := &cliproxyauth.Auth{ID: "claude-cred-default", Attributes: map[string]string{"api_key": "key-web-search", "base_url": server.URL}}
 	streamJSON := "false"
 	if stream {
 		streamJSON = "true"
 	}
 	for _, run := range runs {
+		auth := defaultAuth
+		if run.auth != nil {
+			cloned := run.auth.Clone()
+			if cloned.Attributes == nil {
+				cloned.Attributes = make(map[string]string)
+			}
+			if cloned.Attributes["base_url"] == "" {
+				cloned.Attributes["base_url"] = server.URL
+			}
+			if cloned.Attributes["api_key"] == "" {
+				cloned.Attributes["api_key"] = "key-web-search"
+			}
+			auth = cloned
+		}
 		payload := []byte(`{"model":"claude-opus-5-5","stream":` + streamJSON + `,"input":[` + run.input + `]}`)
 		req := cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}
 		opts := cliproxyexecutor.Options{
@@ -214,7 +229,7 @@ func TestClaudeExecutor_WebSearchResultRestoreRunsBeforePayloadRules(t *testing.
 			if len(bodies) != 2 {
 				t.Fatalf("upstream requests = %d, want 2", len(bodies))
 			}
-			block := gjson.GetBytes(bodies[1], "messages.1.content.1")
+			block := ojson.GetBytes(bodies[1], "messages.1.content.1")
 			if block.Get("type").String() != "web_search_tool_result" {
 				t.Fatalf("messages.1.content.1 = %s, want the web_search_tool_result block", block.Raw)
 			}
@@ -298,18 +313,62 @@ func TestClaudeExecutor_CountTokensRestoresWebSearchResultsWhenEnabled(t *testin
 	if errDisabledCount != nil {
 		t.Fatalf("disabled CountTokens() error = %v", errDisabledCount)
 	}
-	enabledTokens := gjson.GetBytes(enabledCountResp.Payload, "input_tokens").Int()
-	disabledTokens := gjson.GetBytes(disabledCountResp.Payload, "input_tokens").Int()
+	enabledTokens := ojson.GetBytes(enabledCountResp.Payload, "input_tokens").Int()
+	disabledTokens := ojson.GetBytes(disabledCountResp.Payload, "input_tokens").Int()
 	if enabledTokens <= disabledTokens {
 		t.Fatalf("enabled input_tokens (%d) <= disabled input_tokens (%d); want restored search results counted", enabledTokens, disabledTokens)
+	}
+	otherAuth := &cliproxyauth.Auth{ID: "other-cred", Attributes: map[string]string{"api_key": "key-other", "base_url": server.URL}}
+	otherCredCountResp, errOtherCredCount := enabledExec.CountTokens(context.Background(), otherAuth, historyReq, historyOpts)
+	if errOtherCredCount != nil {
+		t.Fatalf("other credential CountTokens() error = %v", errOtherCredCount)
+	}
+	otherCredTokens := ojson.GetBytes(otherCredCountResp.Payload, "input_tokens").Int()
+	if otherCredTokens != disabledTokens {
+		t.Fatalf("other credential input_tokens = %d, want %d (unrestored empty search results)", otherCredTokens, disabledTokens)
+	}
+}
+
+func TestClaudeExecutor_WebSearchResultCacheScopesByCredential(t *testing.T) {
+	cfg := enabledClaudeWebSearchCacheConfig()
+	credA := &cliproxyauth.Auth{ID: "claude-cred-a"}
+	credB := &cliproxyauth.Auth{ID: "claude-cred-b"}
+	keyA := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-a"}}
+	keyB := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-b"}}
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			bodies := runClaudeWebSearchScenario(t, cfg, stream, []claudeWebSearchExecutorRun{
+				{sessionID: "session-ws", auth: credA, input: claudeWebSearchExecutorUser},
+				{sessionID: "session-ws", auth: credB, input: claudeWebSearchExecutorHistory},
+				{sessionID: "session-ws", auth: credA, input: claudeWebSearchExecutorHistory},
+				{sessionID: "session-key", auth: keyA, input: claudeWebSearchExecutorUser},
+				{sessionID: "session-key", auth: keyB, input: claudeWebSearchExecutorHistory},
+				{sessionID: "session-key", auth: keyA, input: claudeWebSearchExecutorHistory},
+			})
+			if len(bodies) != 6 {
+				t.Fatalf("upstream requests = %d, want 6", len(bodies))
+			}
+			if got := claudeWebSearchResultContent(t, bodies[1]); got != "[]" {
+				t.Fatalf("different credential ID in same session: web_search_tool_result content = %s, want []", got)
+			}
+			if got := claudeWebSearchResultContent(t, bodies[2]); got != claudeWebSearchExecutorResults {
+				t.Fatalf("original credential ID in same session: web_search_tool_result content = %s, want original results", got)
+			}
+			if got := claudeWebSearchResultContent(t, bodies[4]); got != "[]" {
+				t.Fatalf("different API key in same session: web_search_tool_result content = %s, want []", got)
+			}
+			if got := claudeWebSearchResultContent(t, bodies[5]); got != claudeWebSearchExecutorResults {
+				t.Fatalf("original API key in same session: web_search_tool_result content = %s, want original results", got)
+			}
+		})
 	}
 }
 
 func claudeWebSearchResultContent(t *testing.T, body []byte) string {
 	t.Helper()
 	var found string
-	gjson.GetBytes(body, "messages").ForEach(func(_, message gjson.Result) bool {
-		message.Get("content").ForEach(func(_, block gjson.Result) bool {
+	ojson.GetBytes(body, "messages").ForEach(func(_, message ojson.Result) bool {
+		message.Get("content").ForEach(func(_, block ojson.Result) bool {
 			if block.Get("type").String() == "web_search_tool_result" {
 				found = block.Get("content").Raw
 				return false
