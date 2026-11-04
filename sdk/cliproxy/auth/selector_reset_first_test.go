@@ -26,7 +26,7 @@ func resetFirstAuth(id, provider string, fiveHourReset, weeklyReset time.Time) *
 	return &Auth{ID: id, Provider: provider, Quota: QuotaState{Signals: signals}}
 }
 
-func TestResetFirstSelectorPick_PrefersFiveHourResetBeforeWeekly(t *testing.T) {
+func TestResetFirstSelectorPick_PrefersWeeklyResetBeforeFiveHour(t *testing.T) {
 	t.Parallel()
 
 	for _, provider := range []string{"claude", "codex"} {
@@ -40,8 +40,8 @@ func TestResetFirstSelectorPick_PrefersFiveHourResetBeforeWeekly(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Pick() error = %v", err)
 			}
-			if got == nil || got.ID != "five-hour-soon" {
-				t.Fatalf("Pick() = %+v, want five-hour-soon", got)
+			if got == nil || got.ID != "weekly-soon" {
+				t.Fatalf("Pick() = %+v, want weekly-soon", got)
 			}
 		})
 	}
@@ -59,29 +59,29 @@ func TestOrderByQuotaReset_WindowFallbacks(t *testing.T) {
 				want  []string
 			}{
 				{
-					name: "weekly breaks equal five-hour resets",
+					name: "earliest weekly reset wins over an earlier five-hour reset",
 					auths: []*Auth{
-						resetFirstAuth("a", provider, now.Add(time.Hour), now.Add(5*24*time.Hour)),
+						resetFirstAuth("a", provider, now.Add(30*time.Minute), now.Add(5*24*time.Hour)),
+						resetFirstAuth("b", provider, now.Add(4*time.Hour), now.Add(24*time.Hour)),
+					},
+					want: []string{"b", "a"},
+				},
+				{
+					name: "five-hour reset breaks equal weekly resets",
+					auths: []*Auth{
+						resetFirstAuth("a", provider, now.Add(4*time.Hour), now.Add(24*time.Hour)),
+						resetFirstAuth("c", provider, time.Time{}, now.Add(24*time.Hour)),
 						resetFirstAuth("b", provider, now.Add(time.Hour), now.Add(24*time.Hour)),
 					},
-					want: []string{"b", "a"},
+					want: []string{"b", "a", "c"},
 				},
 				{
-					name: "weekly decides when five-hour resets are unknown or elapsed",
+					name: "known weekly reset outranks unknown even with an earlier five-hour reset",
 					auths: []*Auth{
-						resetFirstAuth("a", provider, time.Time{}, now.Add(5*24*time.Hour)),
-						resetFirstAuth("b", provider, now.Add(-time.Minute), now.Add(24*time.Hour)),
-						resetFirstAuth("c", provider, now, now.Add(2*24*time.Hour)),
+						resetFirstAuth("a", provider, time.Time{}, now.Add(2*24*time.Hour)),
+						resetFirstAuth("b", provider, now.Add(30*time.Minute), time.Time{}),
 					},
-					want: []string{"b", "c", "a"},
-				},
-				{
-					name: "known five-hour reset outranks unknown even without weekly reset",
-					auths: []*Auth{
-						resetFirstAuth("a", provider, time.Time{}, now.Add(time.Hour)),
-						resetFirstAuth("b", provider, now.Add(4*time.Hour), time.Time{}),
-					},
-					want: []string{"b", "a"},
+					want: []string{"a", "b"},
 				},
 				{
 					name: "known weekly reset outranks unknown or elapsed then ID breaks ties",
@@ -91,6 +91,16 @@ func TestOrderByQuotaReset_WindowFallbacks(t *testing.T) {
 						resetFirstAuth("c", provider, now.Add(time.Hour), now.Add(24*time.Hour)),
 					},
 					want: []string{"c", "a", "b"},
+				},
+				{
+					name: "accounts without a known future reset are probed first",
+					auths: []*Auth{
+						resetFirstAuth("a", provider, now.Add(time.Hour), now.Add(24*time.Hour)),
+						resetFirstAuth("c", provider, now.Add(-time.Minute), now.Add(-time.Minute)),
+						resetFirstAuth("b", provider, time.Time{}, time.Time{}),
+						{ID: "0-unsupported", Provider: "gemini"},
+					},
+					want: []string{"b", "c", "a", "0-unsupported"},
 				},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
@@ -156,6 +166,17 @@ func TestQuotaResetsAt_CodexAbsoluteAndRelative(t *testing.T) {
 			},
 			want: quotaResetWindows{fiveHour: observed.Add(time.Hour)},
 		},
+		{
+			name:       "window length decides the slot when the weekly window is primary",
+			observedAt: observed,
+			signals: map[string]string{
+				"X-Codex-Primary-Reset-At":              strconv.FormatInt(now.Add(3*24*time.Hour).Unix(), 10),
+				"X-Codex-Primary-Window-Minutes":        "10080",
+				"X-Codex-Secondary-Reset-After-Seconds": "0",
+				"X-Codex-Secondary-Window-Minutes":      "0",
+			},
+			want: quotaResetWindows{weekly: now.Add(3 * 24 * time.Hour)},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			auth := &Auth{Provider: "codex", Quota: QuotaState{ObservedAt: tc.observedAt, Signals: tc.signals}}
@@ -178,8 +199,8 @@ func TestResetFirstSessionAffinity_PreservesBindingAcrossResetChanges(t *testing
 	for _, provider := range []string{"claude", "codex"} {
 		t.Run(provider, func(t *testing.T) {
 			now := time.Now().Truncate(time.Second)
-			a := resetFirstAuth("a", provider, now.Add(30*time.Minute), now.Add(5*24*time.Hour))
-			b := resetFirstAuth("b", provider, now.Add(2*time.Hour), now.Add(24*time.Hour))
+			a := resetFirstAuth("a", provider, now.Add(2*time.Hour), now.Add(24*time.Hour))
+			b := resetFirstAuth("b", provider, now.Add(30*time.Minute), now.Add(5*24*time.Hour))
 			auths := []*Auth{a, b}
 			selector := NewSessionAffinitySelector(&ResetFirstSelector{})
 			defer selector.Stop()
