@@ -21,6 +21,42 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:     "claude-fable-5-1-max",
 		},
 		{
+			name:     "direct swe-2-flash-high unchanged",
+			rawModel: "swe-2-flash-high",
+			want:     "swe-2-flash-high",
+		},
+		{
+			name:          "swe-2-flash default to high when no effort",
+			rawModel:      "swe-2-flash",
+			thinkingLevel: "",
+			want:          "swe-2-flash-high",
+		},
+		{
+			name:          "swe-2-flash with medium effort",
+			rawModel:      "swe-2-flash",
+			thinkingLevel: "medium",
+			want:          "swe-2-flash-medium",
+		},
+		{
+			name:          "swe-2-flash with max effort suffix",
+			rawModel:      "swe-2-flash(max)",
+			thinkingLevel: "",
+			want:          "swe-2-flash-max",
+		},
+		{
+			name:          "devin/swe-2-flash with colon medium",
+			rawModel:      "devin/swe-2-flash:medium",
+			thinkingLevel: "",
+			want:          "swe-2-flash-medium",
+		},
+		{
+			name:          "zero suffix overrides body effort and budget",
+			rawModel:      "devin/MODEL_GPT_5_2(0)",
+			thinkingLevel: "high",
+			budgetTokens:  32768,
+			want:          "MODEL_GPT_5_2_NONE",
+		},
+		{
 			name:     "direct swe-2-high unchanged",
 			rawModel: "swe-2-high",
 			want:     "swe-2-high",
@@ -44,10 +80,10 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "swe-2-medium",
 		},
 		{
-			name:          "swe-2 with xhigh maps to max",
+			name:          "swe-2 with xhigh maps to high on a tie",
 			rawModel:      "swe-2",
 			thinkingLevel: "xhigh",
-			want:          "swe-2-max",
+			want:          "swe-2-high",
 		},
 		{
 			name:          "swe-2 request max",
@@ -62,16 +98,22 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "swe-2-max",
 		},
 		{
+			name:          "swe-2 numeric suffix overrides body effort and prefers the lower level on ties",
+			rawModel:      "swe-2(32768)",
+			thinkingLevel: "max",
+			want:          "swe-2-high",
+		},
+		{
 			name:         "fable-5-1 budget tokens maps to max",
 			rawModel:     "claude-fable-5-1",
 			budgetTokens: 64000,
 			want:         "claude-fable-5-1-max",
 		},
 		{
-			name:         "fable-5-1 budget tokens maps to low",
+			name:         "fable-5-1 budget tokens maps to medium",
 			rawModel:     "claude-fable-5-1",
 			budgetTokens: 2048,
-			want:         "claude-fable-5-1-low",
+			want:         "claude-fable-5-1-medium",
 		},
 		{
 			name:          "fable-5-1 with xhigh",
@@ -86,10 +128,16 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "gpt-6-astra-high",
 		},
 		{
-			name:          "glm-5-3 clamp medium to high",
+			name:          "glm-5-3 clamps medium to low on a tie",
 			rawModel:      "glm-5-3",
 			thinkingLevel: "medium",
-			want:          "glm-5-3-high",
+			want:          "glm-5-3-low",
+		},
+		{
+			name:          "glm-5-3 adaptive body effort chooses the lower tied level",
+			rawModel:      "glm-5-3",
+			thinkingLevel: "adaptive",
+			want:          "glm-5-3-low",
 		},
 		{
 			name:          "devin prefix glm-5-3-flash default high",
@@ -212,10 +260,10 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "deepseek-v4-flash-high",
 		},
 		{
-			name:          "devin prefix deepseek-v4.1-flash with max suffix",
-			rawModel:      "devin/deepseek-v4.1-flash(max)",
+			name:          "devin prefix deepseek-v4.1-flash-1017 with max suffix",
+			rawModel:      "devin/deepseek-v4.1-flash-1017(max)",
 			thinkingLevel: "",
-			want:          "deepseek-v4-1-flash-max",
+			want:          "deepseek-v4-1-flash-1017-max",
 		},
 		{
 			name:          "swe-1-7 default maps to swe-1-7",
@@ -308,10 +356,10 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "gpt-5-4-mini-medium",
 		},
 		{
-			name:          "gpt-5-3-codex default maps to medium",
+			name:          "gpt-5-3-codex removed upstream resolves bare",
 			rawModel:      "devin/gpt-5-3-codex",
 			thinkingLevel: "",
-			want:          "gpt-5-3-codex-medium",
+			want:          "gpt-5-3-codex",
 		},
 		{
 			name:          "claude-opus-5 default maps to medium",
@@ -324,6 +372,54 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			rawModel:      "devin/claude-opus-4-8",
 			thinkingLevel: "",
 			want:          "claude-opus-4-8-medium",
+		},
+		{
+			name:          "claude-opus-5-5 with high-fast suffix maps to high-fast",
+			rawModel:      "devin/claude-opus-5-5(high-fast)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-high-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with max-fast suffix maps to max-fast",
+			rawModel:      "devin/claude-opus-5-5(max-fast)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-max-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with body high-fast effort maps to high-fast",
+			rawModel:      "devin/claude-opus-5-5",
+			thinkingLevel: "high-fast",
+			want:          "claude-opus-5-5-high-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with fast suffix maps to default effort fast",
+			rawModel:      "devin/claude-opus-5-5(fast)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-medium-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with body fast effort maps to default effort fast",
+			rawModel:      "devin/claude-opus-5-5",
+			thinkingLevel: "fast",
+			want:          "claude-opus-5-5-medium-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with high suffix still maps to high",
+			rawModel:      "devin/claude-opus-5-5(high)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-high",
+		},
+		{
+			name:          "claude-haiku-4-5 with high-fast suffix still maps to private alias",
+			rawModel:      "devin/claude-haiku-4-5(high-fast)",
+			thinkingLevel: "",
+			want:          "MODEL_PRIVATE_11",
+		},
+		{
+			name:          "swe-2-lightning with high-fast suffix still maps to high-lightning",
+			rawModel:      "devin/swe-2-lightning(high-fast)",
+			thinkingLevel: "",
+			want:          "swe-2-high-lightning",
 		},
 		{
 			name:          "claude-opus-4-7 default maps to medium",
@@ -362,10 +458,10 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "deepseek-v4-pro-high",
 		},
 		{
-			name:          "grok-4-5 default maps to high",
+			name:          "grok-4-5 removed upstream resolves bare",
 			rawModel:      "devin/grok-4-5",
 			thinkingLevel: "",
-			want:          "grok-4-5-high",
+			want:          "grok-4-5",
 		},
 		{
 			name:          "kimi-k3 default maps to high",
@@ -565,6 +661,60 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			thinkingLevel: "high",
 			want:          "MODEL_CLAUDE_4_5_OPUS_THINKING",
 		},
+		{
+			name:          "swe-2-lightning default maps to swe-2-high-lightning",
+			rawModel:      "devin/swe-2-lightning",
+			thinkingLevel: "",
+			want:          "swe-2-high-lightning",
+		},
+		{
+			name:          "swe-2-lightning with medium suffix maps to swe-2-medium-lightning",
+			rawModel:      "devin/swe-2-lightning(medium)",
+			thinkingLevel: "",
+			want:          "swe-2-medium-lightning",
+		},
+		{
+			name:          "swe-2-lightning with colon max maps to swe-2-max-lightning",
+			rawModel:      "devin/swe-2-lightning:max",
+			thinkingLevel: "",
+			want:          "swe-2-max-lightning",
+		},
+		{
+			name:          "swe-2-lightning body effort maps to swe-2-medium-lightning",
+			rawModel:      "devin/swe-2-lightning",
+			thinkingLevel: "medium",
+			want:          "swe-2-medium-lightning",
+		},
+		{
+			name:          "swe-2-lightning suffix overrides body effort",
+			rawModel:      "devin/swe-2-lightning(max)",
+			thinkingLevel: "medium",
+			want:          "swe-2-max-lightning",
+		},
+		{
+			name:          "swe-2-high-lightning direct UID passes through",
+			rawModel:      "devin/swe-2-high-lightning",
+			thinkingLevel: "",
+			want:          "swe-2-high-lightning",
+		},
+		{
+			name:          "swe-2-medium-lightning direct UID passes through",
+			rawModel:      "devin/swe-2-medium-lightning",
+			thinkingLevel: "",
+			want:          "swe-2-medium-lightning",
+		},
+		{
+			name:          "swe-2-high-lightning with suffix still passes through complete UID",
+			rawModel:      "devin/swe-2-high-lightning(max)",
+			thinkingLevel: "",
+			want:          "swe-2-high-lightning",
+		},
+		{
+			name:          "swe-2-lightning clamps unsupported effort",
+			rawModel:      "devin/swe-2-lightning(low)",
+			thinkingLevel: "",
+			want:          "swe-2-medium-lightning",
+		},
 	}
 
 	for _, tt := range tests {
@@ -574,6 +724,28 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 				t.Errorf("ResolveDevinChatModelUID(%q, %q, %d) = %q, want %q", tt.rawModel, tt.thinkingLevel, tt.budgetTokens, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveDevinChatModelUID_AutoEffort(t *testing.T) {
+	for _, tc := range []struct{ model, want string }{
+		{"gpt-6-sol", "gpt-6-sol-medium"},
+		{"swe-2", "swe-2-medium"},
+		{"swe-2-lightning", "swe-2-medium-lightning"},
+		{"glm-5-3", "glm-5-3-low"},
+		{"deepseek-v4-flash", "deepseek-v4-flash-high"},
+		{"glm-5-2-1m", "glm-5-2-max-1m"},
+		{"MODEL_GPT_5_2", "MODEL_GPT_5_2_MEDIUM"},
+		{"kimi-k2-6", "kimi-k2-6"},
+	} {
+		for _, suffix := range []string{"(auto)", "(-1)"} {
+			model := "devin/" + tc.model + suffix
+			t.Run(model, func(t *testing.T) {
+				if got := ResolveDevinChatModelUID(model, "max", 64000); got != tc.want {
+					t.Errorf("upstream UID = %q, want %q", got, tc.want)
+				}
+			})
+		}
 	}
 }
 

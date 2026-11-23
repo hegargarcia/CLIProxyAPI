@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"path/filepath"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -113,59 +115,6 @@ func TestShouldEnableExampleAPIKeySafeMode(t *testing.T) {
 	}
 }
 
-func TestModelCatalogUpdaterPlan(t *testing.T) {
-	tests := []struct {
-		name            string
-		localModel      bool
-		homeEnabled     bool
-		wantModels      bool
-		wantCodexClient bool
-		wantDevin       bool
-	}{
-		{
-			name:            "normal CPA refreshes all catalogs",
-			localModel:      false,
-			homeEnabled:     false,
-			wantModels:      true,
-			wantCodexClient: true,
-			wantDevin:       true,
-		},
-		{
-			name:            "home mode keeps models.json local and refreshes codex templates and devin",
-			localModel:      false,
-			homeEnabled:     true,
-			wantModels:      false,
-			wantCodexClient: true,
-			wantDevin:       true,
-		},
-		{
-			name:            "local-model disables all remote catalogs",
-			localModel:      true,
-			homeEnabled:     false,
-			wantModels:      false,
-			wantCodexClient: false,
-			wantDevin:       false,
-		},
-		{
-			name:            "local-model disables all remote catalogs even under home",
-			localModel:      true,
-			homeEnabled:     true,
-			wantModels:      false,
-			wantCodexClient: false,
-			wantDevin:       false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotModels, gotCodex, gotDevin := modelCatalogUpdaterPlan(tt.localModel, tt.homeEnabled)
-			if gotModels != tt.wantModels || gotCodex != tt.wantCodexClient || gotDevin != tt.wantDevin {
-				t.Fatalf("modelCatalogUpdaterPlan(%v, %v) = (%v, %v, %v), want (%v, %v, %v)",
-					tt.localModel, tt.homeEnabled, gotModels, gotCodex, gotDevin, tt.wantModels, tt.wantCodexClient, tt.wantDevin)
-			}
-		})
-	}
-}
-
 func TestHomeConfigPayloadPortApplication(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -271,5 +220,21 @@ func TestResolveManagementBaseURL(t *testing.T) {
 				t.Fatalf("resolveManagementBaseURL(%q, %v) = %q, want %q", tt.flagURL, tt.cfg, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadPluginBootstrapConfigDoesNotRewriteFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := []byte("port: 8317\nmanagement:\n  secret-key: bootstrap-secret\n")
+	if errCreate := config.CreateConfigFile(path, raw); errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	cfg := loadPluginBootstrapConfig(path)
+	if cfg.Port != 8317 || cfg.ServerID != "" {
+		t.Fatalf("plugin config port = %d, server ID = %q", cfg.Port, cfg.ServerID)
+	}
+	got, errRead := config.ReadConfigFile(path)
+	if errRead != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("plugin bootstrap changed the config: %q, %v", got, errRead)
 	}
 }

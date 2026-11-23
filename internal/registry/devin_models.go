@@ -3,13 +3,13 @@ package registry
 import (
 	"bytes"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 
+	"github.com/MoeForge/moego/json"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -32,11 +32,11 @@ var devinCatalogStore = &devinModelsStore{}
 
 func init() {
 	if _, err := loadDevinModelsFromBytes(embeddedDevinModelsJSON, "embed"); err != nil {
-		log.Warnf("registry: failed to parse embedded devin_models.json (will rely on static fallback and remote refresh): %v", err)
+		log.Warnf("registry: failed to parse embedded devin_models.json (will rely on legacy definitions, built-ins, and remote refresh): %v", err)
 	}
 }
 
-const devinBuiltinSWE16SlowID = "devin/swe-1-6-slow"
+const devinBuiltinSWE16SlowID = "swe-1-6-slow"
 
 func devinBuiltinSWE16SlowModelInfo() *ModelInfo {
 	return &ModelInfo{
@@ -62,23 +62,33 @@ func WithDevinBuiltins(models []*ModelInfo) []*ModelInfo {
 	return upsertModelInfos(models, devinBuiltinSWE16SlowModelInfo())
 }
 
-// GetDevinModels returns the active Devin model catalog.
-// It prioritizes the dynamic/embedded devin_models.json catalog, then models.json's devin section,
-// and finally hardcoded staticDevinModels.
+// GetDevinModels returns a copy of the active Devin model catalog.
 func GetDevinModels() []*ModelInfo {
+	return cloneModelInfos(devinModelDefinitions())
+}
+
+// devinModelDefinitions returns read-only definitions from the active snapshot,
+// with the legacy models.json section available as a fallback.
+func devinModelDefinitions() []*ModelInfo {
 	devinCatalogStore.mu.RLock()
 	models := devinCatalogStore.models
 	devinCatalogStore.mu.RUnlock()
 
 	if len(models) > 0 {
-		return WithDevinBuiltins(cloneModelInfos(models))
+		return models
 	}
 
 	if m := getModels(); m != nil && len(m.Devin) > 0 {
-		return WithDevinBuiltins(cloneModelInfos(m.Devin))
+		models = cloneModelInfos(m.Devin)
+		for _, model := range models {
+			if model != nil {
+				model.ID = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model.ID)), "devin/")
+			}
+		}
+		return WithDevinBuiltins(models)
 	}
 
-	return WithDevinBuiltins(cloneModelInfos(staticDevinModels))
+	return WithDevinBuiltins(nil)
 }
 
 // LookupDevinModel looks up a model definition from the active Devin catalog.
@@ -90,36 +100,15 @@ func LookupDevinModel(modelID string) *ModelInfo {
 		return nil
 	}
 
-	devinCatalogStore.mu.RLock()
-	models := devinCatalogStore.models
-	devinCatalogStore.mu.RUnlock()
-
-	if len(models) == 0 {
-		models = GetDevinModels()
-	}
-
-	for _, m := range models {
-		mClean := strings.ToLower(strings.TrimPrefix(m.ID, "devin/"))
-		if mClean == clean {
-			return cloneModelInfo(m)
-		}
-	}
-	for _, m := range WithDevinBuiltins(nil) {
-		mClean := strings.ToLower(strings.TrimPrefix(m.ID, "devin/"))
-		if mClean == clean {
-			return cloneModelInfo(m)
-		}
+	models := devinModelDefinitions()
+	if model := findStaticModel(models, clean); model != nil {
+		return cloneModelInfo(model)
 	}
 
 	// Fallback: If clean is a thinking variant (e.g. claude-opus-5-low-fast or gpt-6-astra-high),
 	// look up its base model (e.g. claude-opus-5 or gpt-6-astra).
 	if base, _ := splitDevinModelID(clean); base != clean && base != "" {
-		for _, m := range models {
-			mClean := strings.ToLower(strings.TrimPrefix(m.ID, "devin/"))
-			if mClean == base {
-				return cloneModelInfo(m)
-			}
-		}
+		return cloneModelInfo(findStaticModel(models, base))
 	}
 	return nil
 }
@@ -215,6 +204,15 @@ var devinCompoundSuffixes = []struct {
 	{suffix: "-thinking", effort: ""},
 	{suffix: "-max-1m", effort: "max", readd: "-1m"},
 	{suffix: "-none-1m", effort: "none", readd: "-1m"},
+	// Lightning tier keeps the effort before the -lightning suffix upstream
+	// (e.g. swe-2-high-lightning), so it aggregates as <base>-lightning.
+	{suffix: "-minimal-lightning", effort: "minimal", readd: "-lightning"},
+	{suffix: "-low-lightning", effort: "low", readd: "-lightning"},
+	{suffix: "-medium-lightning", effort: "medium", readd: "-lightning"},
+	{suffix: "-high-lightning", effort: "high", readd: "-lightning"},
+	{suffix: "-xhigh-lightning", effort: "xhigh", readd: "-lightning"},
+	{suffix: "-max-lightning", effort: "max", readd: "-lightning"},
+	{suffix: "-none-lightning", effort: "none", readd: "-lightning"},
 }
 
 var devinSimpleEffortSuffixes = []struct {
@@ -237,7 +235,7 @@ var devinDisplayNameSuffixes = []string{
 	" Low Thinking", " Medium Thinking", " High Thinking", " XHigh Thinking",
 	" Max Thinking", " No Thinking",
 	" Low", " Medium", " High", " XHigh", " Max", " None", " Minimal",
-	" Thinking", " Fast",
+	" Thinking", " Fast", " Lightning",
 }
 
 var devinLevelOrder = map[string]int{
@@ -331,18 +329,17 @@ func aggregateDevinModels(models []*ModelInfo) []*ModelInfo {
 		if m == nil {
 			continue
 		}
-		cleanID := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(m.ID), "devin/"))
+		cleanID := m.ID
 		baseID, effort := splitDevinModelID(cleanID)
 		if baseID == "" {
 			baseID = cleanID
 		}
-		namespacedBase := "devin/" + baseID
 		isBase := (baseID == cleanID)
 
-		entry, exists := aggregated[namespacedBase]
+		entry, exists := aggregated[baseID]
 		if !exists {
 			clone := *m
-			clone.ID = namespacedBase
+			clone.ID = baseID
 			clone.DisplayName = cleanDevinDisplayName(m.DisplayName)
 			if clone.DisplayName == "" {
 				clone.DisplayName = m.DisplayName
@@ -351,8 +348,8 @@ func aggregateDevinModels(models []*ModelInfo) []*ModelInfo {
 				model:  &clone,
 				levels: make(map[string]struct{}),
 			}
-			aggregated[namespacedBase] = entry
-			order = append(order, namespacedBase)
+			aggregated[baseID] = entry
+			order = append(order, baseID)
 		}
 
 		if isBase {
@@ -407,6 +404,13 @@ func aggregateDevinModels(models []*ModelInfo) []*ModelInfo {
 	for _, id := range order {
 		entry := aggregated[id]
 		m := entry.model
+
+		// Lightning display names strip both the effort word and "Lightning";
+		// re-append it so devin/swe-2-lightning shows as "SWE-2 Lightning".
+		if strings.HasSuffix(id, "-lightning") &&
+			!strings.HasSuffix(strings.ToLower(m.DisplayName), "lightning") {
+			m.DisplayName = strings.TrimSpace(m.DisplayName + " Lightning")
+		}
 
 		if len(entry.levels) > 0 {
 			lvls := make([]string, 0, len(entry.levels))
@@ -468,15 +472,10 @@ func sanitizeAndValidateDevinModels(models []*ModelInfo) ([]*ModelInfo, error) {
 		if m == nil {
 			return nil, fmt.Errorf("model at index %d is null", i)
 		}
-		id := strings.TrimSpace(m.ID)
+		id := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(m.ID)), "devin/")
 		if id == "" {
 			return nil, fmt.Errorf("model at index %d has empty id", i)
 		}
-		// Automatically namespace model IDs under devin/ if not already prefixed
-		if !strings.HasPrefix(strings.ToLower(id), "devin/") {
-			id = "devin/" + id
-		}
-		id = strings.ToLower(id)
 		m.ID = id
 		if _, exists := seenExact[id]; exists {
 			return nil, fmt.Errorf("duplicate model id: %q", id)
