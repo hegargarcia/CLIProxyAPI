@@ -5,18 +5,18 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	applypatch "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/apply-patch"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 func ConvertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
-	return convertOpenAIResponsesRequestToInteractions(modelName, inputRawJSON, stream)
-
+	return convertOpenAIResponsesRequestToInteractions(modelName, inputRawJSON, stream, false)
 }
 
 // convertOpenAIResponsesRequestToInteractions also reports a file, audio or video
 // part Interactions cannot receive when it leaves a user turn with nothing to send.
-func convertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
+func convertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON []byte, stream, replayDevin bool) ([]byte, error) {
 	var drops translatorcommon.UserTurnDrops
 	root := util.ParseGJSONBytesNoCopy(inputRawJSON)
 	outDoc := ojson.NewDocString(`{"model":"","input":[]}`)
@@ -40,7 +40,7 @@ func convertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON 
 	forAntigravity := isAntigravityModel(model)
 	forDevin := isDevinModel(model) || !forAntigravity
 	if input := root.Get("input"); input.Exists() {
-		setResponsesInputOnInteractionsDoc(outDoc, input, forAntigravity, &drops)
+		setResponsesInputOnInteractionsDoc(outDoc, input, forAntigravity, replayDevin, &drops)
 	}
 	appendResponsesToolsToInteractionsDoc(outDoc, root, forAntigravity, forDevin)
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
@@ -237,20 +237,20 @@ func interactionsThinkingEffort(root ojson.Result) string {
 	return ""
 }
 
-func setResponsesInputOnInteractionsDoc(outDoc *ojson.Doc, input ojson.Result, forAntigravity bool, drops *translatorcommon.UserTurnDrops) {
+func setResponsesInputOnInteractionsDoc(outDoc *ojson.Doc, input ojson.Result, forAntigravity, replayDevin bool, drops *translatorcommon.UserTurnDrops) {
 	functionNamesByCallID := make(map[string]string)
 	items := make([][]byte, 0)
 	if input.Type == ojson.String {
 		items = append(items, interactionsTextStep("user_input", input.String()))
 	} else if input.IsArray() {
 		input.ForEach(func(_, item ojson.Result) bool {
-			if converted := responsesInputItemToInteractions(item, functionNamesByCallID, forAntigravity, drops); converted != nil {
+			if converted := responsesInputItemToInteractions(item, functionNamesByCallID, forAntigravity, replayDevin, drops); converted != nil {
 				items = append(items, converted)
 			}
 			return true
 		})
 	} else if input.IsObject() {
-		if converted := responsesInputItemToInteractions(input, functionNamesByCallID, forAntigravity, drops); converted != nil {
+		if converted := responsesInputItemToInteractions(input, functionNamesByCallID, forAntigravity, replayDevin, drops); converted != nil {
 			items = append(items, converted)
 		}
 	}
@@ -269,7 +269,7 @@ func responsesUserTurnDrops(role string, drops *translatorcommon.UserTurnDrops) 
 	return nil
 }
 
-func responsesInputItemToInteractions(item ojson.Result, functionNamesByCallID map[string]string, forAntigravity bool, drops *translatorcommon.UserTurnDrops) []byte {
+func responsesInputItemToInteractions(item ojson.Result, functionNamesByCallID map[string]string, forAntigravity, replayDevin bool, drops *translatorcommon.UserTurnDrops) []byte {
 	switch item.Get("type").String() {
 	case "message":
 		stepType := "user_input"
@@ -305,6 +305,8 @@ func responsesInputItemToInteractions(item ojson.Result, functionNamesByCallID m
 		return responsesCustomToolCallToInteractions(item, forAntigravity)
 	case "function_call_output", "custom_tool_call_output":
 		return responsesFunctionOutputToInteractions(item, functionNamesByCallID, forAntigravity)
+	case "reasoning":
+		return responsesReasoningToInteractions(item, replayDevin)
 	case "input_text", "output_text", "text":
 		stepType := "user_input"
 		if item.Get("type").String() == "output_text" {
@@ -546,6 +548,40 @@ func responsesFunctionOutputToInteractions(item ojson.Result, functionNamesByCal
 	}
 	setJSONValueDoc(outDoc, "result", result, `{}`)
 	return outDoc.Bytes()
+}
+
+// responsesReasoningToInteractions restores supported signatures on tool-call turns.
+func responsesReasoningToInteractions(item ojson.Result, replayDevin bool) []byte {
+	content := item.Get("encrypted_content")
+	if content.Type != ojson.String {
+		return nil
+	}
+	raw := content.String()
+	sig := strings.TrimSpace(raw)
+	openAI := replayDevin && signature.IsDevinOpenAIReasoningSignature(raw)
+	// Devin issues Gemini thought signatures in the unprefixed Vertex bare-Tink envelope.
+	// Replay only that shape: Devin rejects a request whose signature it cannot verify.
+	gemini := replayDevin && !strings.Contains(sig, "#") && signature.IsGeminiVertexBareTinkSignature(sig)
+	if !openAI && !gemini && !strings.HasPrefix(sig, "sealed.v1.") {
+		return nil
+	}
+	var texts []string
+	item.Get("summary").ForEach(func(_, part ojson.Result) bool {
+		if t := part.Get("text").String(); t != "" {
+			texts = append(texts, t)
+		}
+		return true
+	})
+	stepDoc := ojson.NewDocString(`{"type":"thought","content":[{"type":"text","text":""}],"signature":""}`)
+	_ = stepDoc.Set("content.0.text", strings.Join(texts, "\n\n"))
+	if openAI {
+		sig = raw
+		_ = stepDoc.Set("signature_type", "openai")
+	} else if gemini {
+		_ = stepDoc.Set("signature_type", "gemini")
+	}
+	_ = stepDoc.Set("signature", sig)
+	return stepDoc.Bytes()
 }
 
 func interactionsTextStep(stepType, text string) []byte {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
@@ -119,10 +120,10 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 				}
 			} else if cb.Get("type").String() == "thinking" {
 				if sig := cb.Get("signature"); sig.Exists() && sig.String() != "" {
-					thinkingPart := []byte(`{"thought":true,"thoughtSignature":""}`)
-					thinkingPart, _ = ojson.SetBytes(thinkingPart, "thoughtSignature", sigcompat.GeminiReplaySignatureOrBypass(sig.String(), sigcompat.SignatureBlockKindGeminiModelPart))
-					_ = templateDoc.SetRawBytes("candidates.0.content.parts.-1", thinkingPart)
-					return [][]byte{templateDoc.Bytes()}
+					if thinkingPart := geminiCompatibleThoughtSignaturePart(sig.String()); len(thinkingPart) > 0 {
+						_ = templateDoc.SetRawBytes("candidates.0.content.parts.-1", thinkingPart)
+						return [][]byte{templateDoc.Bytes()}
+					}
 				}
 			}
 		}
@@ -150,9 +151,11 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 				}
 			case "signature_delta":
 				if sig := delta.Get("signature"); sig.Exists() && sig.String() != "" {
-					thinkingPart := []byte(`{"thought":true,"thoughtSignature":""}`)
-					thinkingPart, _ = ojson.SetBytes(thinkingPart, "thoughtSignature", sigcompat.GeminiReplaySignatureOrBypass(sig.String(), sigcompat.SignatureBlockKindGeminiModelPart))
-					_ = templateDoc.SetRawBytes("candidates.0.content.parts.-1", thinkingPart)
+					if thinkingPart := geminiCompatibleThoughtSignaturePart(sig.String()); len(thinkingPart) > 0 {
+						_ = templateDoc.SetRawBytes("candidates.0.content.parts.-1", thinkingPart)
+					} else {
+						return [][]byte{}
+					}
 				}
 			case "input_json_delta":
 				// Tool use input delta - accumulate partial_json by index for later assembly at content_block_stop
@@ -224,20 +227,10 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 
 	case "message_delta":
 		// Handle message-level changes (like stop reason and usage information)
+		_ = templateDoc.Set("candidates.0.finishReason", "STOP")
 		if delta := root.Get("delta"); delta.Exists() {
-			if stopReason := delta.Get("stop_reason"); stopReason.Exists() {
-				switch stopReason.String() {
-				case "end_turn":
-					_ = templateDoc.Set("candidates.0.finishReason", "STOP")
-				case "tool_use":
-					_ = templateDoc.Set("candidates.0.finishReason", "STOP")
-				case "max_tokens":
-					_ = templateDoc.Set("candidates.0.finishReason", "MAX_TOKENS")
-				case "stop_sequence":
-					_ = templateDoc.Set("candidates.0.finishReason", "STOP")
-				default:
-					_ = templateDoc.Set("candidates.0.finishReason", "STOP")
-				}
+			if stopReason := delta.Get("stop_reason"); stopReason.Exists() && stopReason.String() == "max_tokens" {
+				_ = templateDoc.Set("candidates.0.finishReason", "MAX_TOKENS")
 			}
 		}
 
@@ -270,7 +263,6 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			// Set traffic type (required by Gemini API)
 			_ = templateDoc.Set("usageMetadata.trafficType", "PROVISIONED_THROUGHPUT")
 		}
-		_ = templateDoc.Set("candidates.0.finishReason", "STOP")
 
 		return [][]byte{templateDoc.Bytes()}
 	case "message_stop":
@@ -393,9 +385,9 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 					}
 				} else if cb.Get("type").String() == "thinking" {
 					if sig := cb.Get("signature"); sig.Exists() && sig.String() != "" {
-						partJSON := []byte(`{"thought":true,"thoughtSignature":""}`)
-						partJSON, _ = ojson.SetBytes(partJSON, "thoughtSignature", sigcompat.GeminiReplaySignatureOrBypass(sig.String(), sigcompat.SignatureBlockKindGeminiModelPart))
-						allParts = append(allParts, partJSON)
+						if partJSON := geminiCompatibleThoughtSignaturePart(sig.String()); len(partJSON) > 0 {
+							allParts = append(allParts, partJSON)
+						}
 					}
 				}
 			}
@@ -422,9 +414,9 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 					}
 				case "signature_delta":
 					if sig := delta.Get("signature"); sig.Exists() && sig.String() != "" {
-						partJSON := []byte(`{"thought":true,"thoughtSignature":""}`)
-						partJSON, _ = ojson.SetBytes(partJSON, "thoughtSignature", sigcompat.GeminiReplaySignatureOrBypass(sig.String(), sigcompat.SignatureBlockKindGeminiModelPart))
-						allParts = append(allParts, partJSON)
+						if partJSON := geminiCompatibleThoughtSignaturePart(sig.String()); len(partJSON) > 0 {
+							allParts = append(allParts, partJSON)
+						}
 					}
 				case "input_json_delta":
 					// accumulate args partial_json for this index
@@ -548,6 +540,25 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 
 func GeminiTokenCount(ctx context.Context, count int64) []byte {
 	return translatorcommon.GeminiTokenCountJSON(count)
+}
+
+// geminiCompatibleThoughtSignaturePart omits incompatible signatures rather
+// than emitting a function-call bypass sentinel in a thought part's byte field.
+func geminiCompatibleThoughtSignaturePart(rawSignature string) []byte {
+	signature := sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
+	if sigcompat.IsGeminiThoughtSignatureBypass(signature) {
+		return nil
+	}
+	if _, errDecode := base64.StdEncoding.DecodeString(signature); errDecode != nil {
+		decoded, errRawDecode := base64.RawStdEncoding.DecodeString(signature)
+		if errRawDecode != nil {
+			return nil
+		}
+		signature = base64.StdEncoding.EncodeToString(decoded)
+	}
+	partDoc := ojson.NewDocString(`{"thought":true,"thoughtSignature":""}`)
+	_ = partDoc.Set("thoughtSignature", signature)
+	return partDoc.Bytes()
 }
 
 // consolidateParts merges consecutive text parts and thinking parts to create a cleaner response.

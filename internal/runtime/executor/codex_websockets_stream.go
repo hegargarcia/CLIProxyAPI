@@ -30,32 +30,34 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	isCompat, errExpand := e.expandCodexResponsesCompaction(auth, &req, &opts, baseModel)
+	if errExpand != nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+	}
+	if e.shouldCompactCompatResponsesTrigger(isCompat, req, opts) {
+		executionSessionID := executionSessionIDFromOptions(opts)
+		var sess *codexWebsocketSession
+		if executionSessionID != "" {
+			sess = e.getOrCreateSession(executionSessionID)
+			if sess != nil {
+				sess.reqMu.Lock()
+				defer sess.reqMu.Unlock()
+			}
+		}
+		res, errCompact := e.CodexExecutor.executeCodexResponsesCompactionStream(ctx, auth, req, opts)
+		if errCompact == nil && sess != nil {
+			sess.connMu.Lock()
+			existingConn := sess.conn
+			sess.connMu.Unlock()
+			if existingConn != nil {
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, existingConn, "local_compaction", nil)
+			}
+		}
+		return res, errCompact
+	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
-
-	prepared, err := e.prepareCodexWebsocketStream(ctx, auth, req, opts)
-	if err != nil {
-		return nil, err
-	}
-	from := prepared.from
-	responseFormat := prepared.responseFormat
-	to := prepared.to
-	preserveNativeOutput := prepared.preserveNativeOutput
-	originalPayload := prepared.originalPayload
-	clientBody := prepared.clientBody
-	wsURL := prepared.wsURL
-	wsHeaders := prepared.wsHeaders
-	useSIWC := prepared.useSIWC
-	replayScope := prepared.replayScope
-	optimizeMultiAgentV2 := prepared.optimizeMultiAgentV2
-	multiAgentV2Conflict := prepared.multiAgentV2Conflict
-	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
-
-	var authID, authLabel, authType, authValue string
-	authID = auth.ID
-	authLabel = auth.Label
-	authType, authValue = auth.AccountInfo()
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
@@ -83,12 +85,39 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
+	prepared, err := e.prepareCodexWebsocketStream(ctx, auth, req, opts, sess)
+	if err != nil {
+		unlockStreamSession()
+		return nil, codexWebsocketTurnEventID(err, req.Payload)
+	}
+	if prepared.upstreamModel != "" && prepared.upstreamModel != baseModel {
+		reporter.SetUpstreamModel(prepared.upstreamModel)
+	}
+	from := prepared.from
+	responseFormat := prepared.responseFormat
+	to := prepared.to
+	preserveNativeOutput := prepared.preserveNativeOutput
+	originalPayload := prepared.originalPayload
+	clientBody := prepared.clientBody
+	wsURL := prepared.wsURL
+	wsHeaders := prepared.wsHeaders
+	useSIWC := prepared.useSIWC
+	replayScope := prepared.replayScope
+	optimizeMultiAgentV2 := prepared.optimizeMultiAgentV2
+	multiAgentV2Conflict := prepared.multiAgentV2Conflict
+	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
+
+	var authID, authLabel, authType, authValue string
+	authID = auth.ID
+	authLabel = auth.Label
+	authType, authValue = auth.AccountInfo()
+
 	wsReqBody := frameCodexWebsocketRequestBody(clientBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
 		Headers:   wsHeaders.Clone(),
-		Body:      wsReqBody,
+		Body:      prepared.sessionInstructions.LogBody(wsReqBody),
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -102,10 +131,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var respHS *http.Response
 	var errDial error
 	dialCtx := ctx
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || prepared.sessionInstructions.ConnectionBound() {
 		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC)
 		if conn == nil {
 			unlockStreamSession()
+			if errConn := prepared.sessionInstructions.OnConnection(nil); errConn != nil {
+				return nil, codexWebsocketTurnEventID(errConn, originalPayload)
+			}
 			if cliproxyexecutor.DownstreamWebsocket(ctx) && sess != nil {
 				sess.activeMu.Lock()
 				lost := cliproxyexecutor.IsUpstreamWebsocketTurnError(sess.terminalErr)
@@ -130,10 +162,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			unlockStreamSession()
 			return nil, codexWebsocketTurnEventID(errDial, originalPayload)
 		}
-		bodyErr := websocketHandshakeBody(respHS)
-		if respHS != nil {
-			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
-		}
+		bodyErr := recordWebsocketDialFailure(ctx, e.cfg, wsReqLog, respHS, errDial)
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			unlockStreamSession()
 			if opts.ExecutionLifecycle == nil && !cliproxyexecutor.DownstreamWebsocket(ctx) {
@@ -151,9 +180,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			unlockStreamSession()
 			return nil, newCodexStatusErrWithHeadersAndCooling(respHS.StatusCode, respHS.Header, bodyErr, e.modelLevelCooling())
 		}
-		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		unlockStreamSession()
 		return nil, errDial
+	}
+	if errConn := prepared.sessionInstructions.OnConnection(conn); errConn != nil {
+		unlockStreamSession()
+		return nil, codexWebsocketTurnEventID(errConn, originalPayload)
 	}
 	if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 		unlockStreamSession()
@@ -180,6 +212,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return nil, codexWebsocketTurnEventID(errLoss, originalPayload)
 		}
 	}
+	prepared.sessionReceipt = sess.sessionInstructions.Sent(conn, prepared.sessionInstructions)
 	cliproxyexecutor.MarkUpstreamAttempt(ctx)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
@@ -214,11 +247,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return nil, errSend
 			}
 
+			if errConn := prepared.sessionInstructions.OnConnection(nil); errConn != nil {
+				sess.clearActive(conn, readCh)
+				unlockStreamSession()
+				return nil, codexWebsocketTurnEventID(errConn, originalPayload)
+			}
+
 			// Retry once with a new websocket connection for the same execution session.
 			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
 			if errDialRetry != nil || connRetry == nil {
-				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
-				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
+				_ = recordWebsocketDialRetryFailure(ctx, e.cfg, wsReqLog, respHSRetry, errDialRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
@@ -239,7 +277,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
 				Headers:   wsHeaders.Clone(),
-				Body:      wsReqBodyRetry,
+				Body:      prepared.sessionInstructions.LogBody(wsReqBodyRetry),
 				Provider:  e.Identifier(),
 				AuthID:    authID,
 				AuthLabel: authLabel,
@@ -248,6 +286,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			reporter.StartResponseTTFT()
+			prepared.sessionReceipt = sess.sessionInstructions.Sent(conn, prepared.sessionInstructions)
 			cliproxyexecutor.MarkUpstreamAttempt(ctx)
 			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
 				errSendRetry = mapCodexWebsocketWriteError(sess, conn, errSendRetry)
@@ -476,7 +515,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					// status the upstream refused to put on the wire.
 					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap overload rejection after %d messages read, failing over", bufferedFrames)
 					if overloadFailover {
-						return nil, newCodexBootstrapOverloadErr(terminalBody)
+						if streamErr.StatusCode() == http.StatusTooManyRequests && streamErr.RetryAfter() != nil {
+							return nil, streamErr
+						}
+						return nil, newCodexBootstrapOverloadErrWithRetryAfter(terminalBody, streamErr.RetryAfter())
 					}
 					return nil, streamErr
 				}
@@ -484,6 +526,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				break
 			}
 
+			prepared.sessionReceipt.Observe(payload)
 			eventType := ojson.GetBytesNoCopy(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
 			if helps.HasMeaningfulCodexOutputDelta(payload) {
@@ -748,6 +791,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return
 			}
 
+			prepared.sessionReceipt.Observe(payload)
 			eventType := ojson.GetBytesNoCopy(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
 			if helps.HasMeaningfulCodexOutputDelta(payload) {
@@ -844,19 +888,30 @@ type codexWebsocketPrepared struct {
 	preserveNativeOutput bool
 	originalPayload      []byte
 	clientBody           []byte
+	upstreamModel        string
 	wsURL                string
 	wsHeaders            http.Header
 	useSIWC              bool
 	replayScope          codexReasoningReplayScope
 	optimizeMultiAgentV2 bool
 	multiAgentV2Conflict bool
+	sessionInstructions  helps.CodexInstructionTurn
+	sessionReceipt       helps.CodexInstructionReceipt
+
+	// Immutable pre-payload JSON value for duplex inheritance; never rebuild from clientBody.
+	// An empty Go string means absent, not an explicitly empty JSON string.
+	unconfiguredInstructions string
 }
 
-func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*codexWebsocketPrepared, error) {
-	if errExpand := helps.ExpandRecognizedResponsesCompactionCapsules(&req, &opts); errExpand != nil {
-		return nil, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sessions ...*codexWebsocketSession) (*codexWebsocketPrepared, error) {
+	if errPrev := rejectSyntheticCompactionPreviousResponseID(ctx, req.Payload); errPrev != nil {
+		return nil, errPrev
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	isCompat, errExpand := e.expandCodexResponsesCompaction(auth, &req, &opts, baseModel)
+	if errExpand != nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+	}
 	apiKey, baseURL := codexCredsForRequest(ctx, auth, opts.Headers)
 	if errSIWC := ensureCodexSIWCCredentialsForRequest(ctx, auth, apiKey, opts.Headers); errSIWC != nil {
 		return nil, errSIWC
@@ -879,7 +934,6 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	isCompat := e.resolveCodexModelIsCompat(auth, req, baseModel)
 	targetModel := resolveResponsesSignatureTargetModel(baseModel, req, opts)
 	originalTranslated, body, updatesChanged, err := translateCodexRequestPairWithUpdateIntentContext(ctx, from, to, targetModel, originalPayload, req.Payload, true, isCompat)
 	if err != nil {
@@ -887,6 +941,11 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	}
 	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
 	doc := ojson.NewDoc(body)
+	if shouldPreserveFullCodexOpenAIInclude(ctx, auth, baseURL, opts.Headers) {
+		originalTranslated = helps.PreserveCodexOpenAIResponsesInclude(originalTranslated, originalPayload, from)
+		helps.PreserveCodexOpenAIResponsesIncludeDoc(doc, req.Payload, from)
+	}
+	normalizeCodexOutputBudgetDoc(doc)
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 
 	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged); err != nil {
@@ -895,13 +954,22 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 
 	instructionsResult := ojson.GetBytesNoCopy(req.Payload, "instructions")
 	hasExplicitInstructions := instructionsResult.Exists() && strings.TrimSpace(instructionsResult.String()) != ""
-	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, "codex-websockets", baseModel, to.String(), "", originalTranslated, req, opts))
+	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, "codex-websockets", baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	ensureWebSearchToolForHistoryDoc(doc, opts.Headers)
+	// Do not let a built-in empty default become caller-provided on the next turn.
+	hadUnconfiguredInstructions := doc.Get("instructions").Exists()
 	if !useSIWC {
 		normalizeCodexInstructionsDoc(doc, preserveNativeOutput)
 		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-			ensureImageGenerationToolDoc(doc, baseModel, auth, opts.Headers)
+			checkModel := req.Model
+			if strings.TrimSpace(checkModel) == "" {
+				checkModel = baseModel
+			}
+			ensureImageGenerationToolDoc(doc, checkModel, auth, opts.Headers)
+			if !codexAuthUsesAPIKey(auth) {
+				normalizeCodexImageGenerationToolsDoc(doc)
+			}
 		}
 	}
 	normalizeCodexWebsocketParallelToolCallsDoc(doc, opts.Headers)
@@ -925,14 +993,38 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		return nil, errPromptCache
 	}
 	helps.SanitizeCodexInputItemIDsDoc(doc)
+	// Retain explicit clearing intent before SIWC removes empty instructions.
+	// The outbound body still follows SIWC cleanup; only inheritance keeps the value.
+	var unconfiguredInstructions string
+	if hadUnconfiguredInstructions {
+		unconfiguredInstructions = strings.Clone(doc.Get("instructions").Raw)
+	}
 	if useSIWC {
 		applyCodexSIWCWebsocketBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
 	}
+	var sess *codexWebsocketSession
+	if len(sessions) > 0 {
+		sess = sessions[0]
+	}
+	sessionInstructions, errSession := e.prepareSessionInstructions(ctx, doc, auth, req, opts, sess, wsURL, useSIWC)
+	if errSession != nil {
+		return nil, errSession
+	}
 	helps.FinalizePayloadDoc(ctx, doc)
 	body = doc.Bytes()
+	if errMarker := helps.ValidateCodexSessionInstructionMarker(body, from); errMarker != nil {
+		return nil, errMarker
+	}
+	if errFinal := sessionInstructions.CheckFinal(body); errFinal != nil {
+		return nil, errFinal
+	}
+	upstreamModel := strings.TrimSpace(doc.Get("model").String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, preserveNativeOutput, opts.Headers)
-	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
-	applyModelHeaderOverrides(wsHeaders, baseModel)
+	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
+	applyModelHeaderOverrides(wsHeaders, upstreamModel)
+	if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, wsHeaders, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
+		return nil, errValidate
+	}
 
 	return &codexWebsocketPrepared{
 		from:                 from,
@@ -941,11 +1033,15 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		preserveNativeOutput: preserveNativeOutput,
 		originalPayload:      originalPayload,
 		clientBody:           body,
+		upstreamModel:        upstreamModel,
 		wsURL:                wsURL,
 		wsHeaders:            wsHeaders,
 		useSIWC:              useSIWC,
 		replayScope:          replayScope,
 		optimizeMultiAgentV2: optimizeMultiAgentV2,
 		multiAgentV2Conflict: multiAgentV2Conflict,
+		sessionInstructions:  sessionInstructions,
+
+		unconfiguredInstructions: unconfiguredInstructions,
 	}, nil
 }

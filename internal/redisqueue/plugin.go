@@ -2,11 +2,11 @@ package redisqueue
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/google/uuid"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
@@ -23,7 +23,12 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	if p == nil {
 		return
 	}
-	if !Enabled() || !UsageStatisticsEnabled() {
+	selectionID := strings.TrimSpace(record.SelectionID)
+	if selectionID == "" {
+		selectionID = coreusage.SelectionIDFromContext(ctx)
+	}
+	// Home scheduler completion feedback is needed even when local statistics are disabled.
+	if !Enabled() || (!UsageStatisticsEnabled() && (selectionID == "" || record.HomeSelection == nil)) {
 		return
 	}
 
@@ -122,6 +127,8 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		VideoInputTokens:         coreusage.CloneInt64Ptr(usageDetail.VideoInputTokens),
 		FileInputTokens:          coreusage.CloneInt64Ptr(usageDetail.FileInputTokens),
 		CachedTextTokens:         coreusage.CloneInt64Ptr(usageDetail.CachedTextTokens),
+		CachedImageTokens:        coreusage.CloneInt64Ptr(usageDetail.CachedImageTokens),
+		CachedAudioTokens:        coreusage.CloneInt64Ptr(usageDetail.CachedAudioTokens),
 		TextOutputTokens:         coreusage.CloneInt64Ptr(usageDetail.TextOutputTokens),
 		ImageOutputTokens:        coreusage.CloneInt64Ptr(usageDetail.ImageOutputTokens),
 		AudioOutputTokens:        coreusage.CloneInt64Ptr(usageDetail.AudioOutputTokens),
@@ -165,6 +172,8 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		AccountingVersion:     coreusage.TokenAccountingSchemaVersion,
 		TokenBreakdown:        usageDetail.TokenBreakdown,
 		Provider:              provider,
+		BaseURL:               record.BaseURL,
+		AuthID:                record.AuthID,
 		ExecutorType:          executorType,
 		Model:                 modelName,
 		Alias:                 aliasName,
@@ -175,6 +184,8 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		AccessProvider:        accessProvider,
 		RequestID:             requestID,
 		ExecutionID:           executionID,
+		SelectionID:           selectionID,
+		HomeSelection:         record.HomeSelection,
 		TraceID:               traceID,
 		SessionID:             sessionID,
 		ParentSessionID:       parentSessionID,
@@ -210,6 +221,8 @@ type queuedUsageDetail struct {
 	AccountingVersion     int                         `json:"accounting_version"`
 	TokenBreakdown        coreusage.TokenBreakdown    `json:"token_breakdown"`
 	Provider              string                      `json:"provider"`
+	BaseURL               string                      `json:"base_url,omitempty"`
+	AuthID                string                      `json:"auth_id,omitempty"`
 	ExecutorType          string                      `json:"executor_type"`
 	Model                 string                      `json:"model"`
 	Alias                 string                      `json:"alias"`
@@ -220,6 +233,8 @@ type queuedUsageDetail struct {
 	AccessProvider        string                      `json:"access_provider,omitempty"`
 	RequestID             string                      `json:"request_id"`
 	ExecutionID           string                      `json:"execution_id,omitempty"`
+	SelectionID           string                      `json:"selection_id,omitempty"`
+	HomeSelection         *coreusage.HomeSelection    `json:"home_selection,omitempty"`
 	TraceID               string                      `json:"trace_id,omitempty"`
 	SessionID             string                      `json:"session_id,omitempty"`
 	ParentSessionID       string                      `json:"parent_session_id,omitempty"`
@@ -282,6 +297,8 @@ type tokenStats struct {
 	VideoInputTokens         *int64 `json:"video_input_tokens,omitempty"`
 	FileInputTokens          *int64 `json:"file_input_tokens,omitempty"`
 	CachedTextTokens         *int64 `json:"cached_text_tokens,omitempty"`
+	CachedImageTokens        *int64 `json:"cached_image_tokens,omitempty"`
+	CachedAudioTokens        *int64 `json:"cached_audio_tokens,omitempty"`
 	TextOutputTokens         *int64 `json:"text_output_tokens,omitempty"`
 	ImageOutputTokens        *int64 `json:"image_output_tokens,omitempty"`
 	AudioOutputTokens        *int64 `json:"audio_output_tokens,omitempty"`

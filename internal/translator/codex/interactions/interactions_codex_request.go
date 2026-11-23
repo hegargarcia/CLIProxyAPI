@@ -1,10 +1,10 @@
 package interactions
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
@@ -25,10 +25,17 @@ func convertInteractionsRequestToCodex(modelName string, inputRawJSON []byte, st
 	if stream || root.Get("stream").Bool() {
 		_ = outDoc.Set("stream", true)
 	}
-	copyInteractionsSystemToCodexDoc(outDoc, root)
 	hasToolChoice := copyInteractionsGenerationConfigToCodexDoc(outDoc, root)
 	signatureTargetModel := translatorcommon.ResolveCodexReplayTargetModel(modelName, inputRawJSON)
-	inputItems := translatorcommon.NewRawArrayItems(root.Get("input.#").Int())
+	systemText := interactionsCodexSystemText(root)
+	inputSize := root.Get("input.#").Int()
+	if systemText != "" {
+		inputSize++
+	}
+	inputItems := translatorcommon.NewRawArrayItems(inputSize)
+	if systemText != "" {
+		appendInteractionsTextToCodex(&inputItems, "developer", systemText)
+	}
 	errInput := appendInteractionsInputToCodex(&inputItems, root.Get("input"), signatureTargetModel)
 	translatorcommon.SetRawArrayItemsDoc(outDoc, "input", inputItems)
 	copyInteractionsToolsToCodexDoc(outDoc, root, hasToolChoice)
@@ -37,21 +44,19 @@ func convertInteractionsRequestToCodex(modelName string, inputRawJSON []byte, st
 	return outDoc.Bytes(), errInput
 }
 
-func copyInteractionsSystemToCodexDoc(doc *ojson.Doc, root ojson.Result) {
+func interactionsCodexSystemText(root ojson.Result) string {
 	systemInstruction := root.Get("system_instruction")
 	if !systemInstruction.Exists() {
 		systemInstruction = root.Get("systemInstruction")
 	}
 	if !systemInstruction.Exists() {
-		return
+		return ""
 	}
 	if systemInstruction.Type == ojson.String {
-		_ = doc.Set("instructions", systemInstruction.String())
-		return
+		return systemInstruction.String()
 	}
 	if text := systemInstruction.Get("text"); text.Exists() && text.Type == ojson.String {
-		_ = doc.Set("instructions", text.String())
-		return
+		return text.String()
 	}
 	if parts := systemInstruction.Get("parts"); parts.Exists() && parts.IsArray() {
 		var builder strings.Builder
@@ -66,10 +71,9 @@ func copyInteractionsSystemToCodexDoc(doc *ojson.Doc, root ojson.Result) {
 			builder.WriteString(text)
 			return true
 		})
-		if builder.Len() > 0 {
-			_ = doc.Set("instructions", builder.String())
-		}
+		return builder.String()
 	}
+	return ""
 }
 
 func copyInteractionsGenerationConfigToCodexDoc(doc *ojson.Doc, root ojson.Result) bool {
@@ -92,34 +96,39 @@ func copyInteractionsGenerationConfigToCodexDoc(doc *ojson.Doc, root ojson.Resul
 	if summary := interactionsCodexReasoningSummary(cfg); summary != "" {
 		_ = doc.Set("reasoning.summary", summary)
 	}
-	copyRawPaths := map[string]string{
-		"max_output_tokens":   "max_output_tokens",
-		"maxOutputTokens":     "max_output_tokens",
-		"max_tokens":          "max_output_tokens",
-		"temperature":         "temperature",
-		"top_p":               "top_p",
-		"topP":                "top_p",
-		"presence_penalty":    "presence_penalty",
-		"presencePenalty":     "presence_penalty",
-		"frequency_penalty":   "frequency_penalty",
-		"frequencyPenalty":    "frequency_penalty",
-		"parallel_tool_calls": "parallel_tool_calls",
-		"parallelToolCalls":   "parallel_tool_calls",
-		"response_format":     "response_format",
-		"responseFormat":      "response_format",
-		"text":                "text",
-		"verbosity":           "text.verbosity",
-		"truncation":          "truncation",
-		"tool_choice":         "tool_choice",
-		"toolChoice":          "tool_choice",
-		"service_tier":        "service_tier",
-		"serviceTier":         "service_tier",
+	copyRawPaths := []struct {
+		sourcePath string
+		targetPath string
+	}{
+		{"max_output_tokens", "max_output_tokens"},
+		{"maxOutputTokens", "max_output_tokens"},
+		{"max_completion_tokens", "max_output_tokens"},
+		{"maxCompletionTokens", "max_output_tokens"},
+		{"max_tokens", "max_output_tokens"},
+		{"temperature", "temperature"},
+		{"top_p", "top_p"},
+		{"topP", "top_p"},
+		{"presence_penalty", "presence_penalty"},
+		{"presencePenalty", "presence_penalty"},
+		{"frequency_penalty", "frequency_penalty"},
+		{"frequencyPenalty", "frequency_penalty"},
+		{"parallel_tool_calls", "parallel_tool_calls"},
+		{"parallelToolCalls", "parallel_tool_calls"},
+		{"response_format", "response_format"},
+		{"responseFormat", "response_format"},
+		{"text", "text"},
+		{"verbosity", "text.verbosity"},
+		{"truncation", "truncation"},
+		{"tool_choice", "tool_choice"},
+		{"toolChoice", "tool_choice"},
+		{"service_tier", "service_tier"},
+		{"serviceTier", "service_tier"},
 	}
 	hasToolChoice := false
-	for sourcePath, targetPath := range copyRawPaths {
-		if value := cfg.Get(sourcePath); value.Exists() {
-			_ = doc.SetRawBytes(targetPath, []byte(value.Raw))
-			if targetPath == "tool_choice" {
+	for _, paths := range copyRawPaths {
+		if value := cfg.Get(paths.sourcePath); value.Exists() && !doc.Get(paths.targetPath).Exists() {
+			_ = doc.SetRawBytes(paths.targetPath, []byte(value.Raw))
+			if paths.targetPath == "tool_choice" {
 				hasToolChoice = true
 			}
 		}
@@ -402,6 +411,22 @@ func copyInteractionsToolsToCodexDoc(doc *ojson.Doc, root ojson.Result, hasToolC
 }
 
 func copyInteractionsCodexTopLevelDoc(doc *ojson.Doc, root ojson.Result) {
+	if !doc.Get("max_output_tokens").Exists() {
+		for _, path := range []string{
+			"max_output_tokens",
+			"maxOutputTokens",
+			"max_completion_tokens",
+			"maxCompletionTokens",
+			"max_tokens",
+			"agent_config.max_total_tokens",
+			"agentConfig.maxTotalTokens",
+		} {
+			if value := root.Get(path); value.Exists() {
+				_ = doc.SetRawBytes("max_output_tokens", []byte(value.Raw))
+				break
+			}
+		}
+	}
 	if serviceTier := normalizeInteractionsCodexServiceTier(root.Get("service_tier")); serviceTier != "" {
 		_ = doc.Set("service_tier", serviceTier)
 	}

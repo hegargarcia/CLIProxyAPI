@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
@@ -102,6 +103,56 @@ func TestDevinExecutorPrepareRequest(t *testing.T) {
 	}
 }
 
+func TestDevinSWE17ModelUIDFromThinkingBudget(t *testing.T) {
+	const model = "devin/swe-1-7"
+	const body = `{"messages":[{"role":"user","content":"hi"}],"max_tokens":20000}`
+	exec := NewDevinExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test-key"}}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
+
+	for _, tc := range []struct {
+		name, model, body, wantUID string
+	}{
+		{"omitted", model, body, "swe-1-7"},
+		{"disabled", model + "(0)", body, "swe-1-7"},
+		{"numeric suffix", model + "(16000)", body, "swe-1-7-medium"},
+		{"Claude body", model, `{"messages":[{"role":"user","content":"hi"}],"max_tokens":20000,"thinking":{"type":"enabled","budget_tokens":16000}}`, "swe-1-7-medium"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := cliproxyexecutor.Request{Model: tc.model, Payload: []byte(tc.body)}
+			httpReq, _, _, errPrep := exec.prepareDevinHTTPRequest(t.Context(), auth, req, opts)
+			if errPrep != nil {
+				t.Fatal(errPrep)
+			}
+			defer func() {
+				if err := httpReq.Body.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			flag, wire, errRead := helps.ReadConnectFrame(httpReq.Body)
+			if errRead != nil || flag != 0 {
+				t.Fatalf("read request frame: flag=%d, err=%v", flag, errRead)
+			}
+			for len(wire) > 0 {
+				num, typ, n := protowire.ConsumeField(wire)
+				if n < 0 {
+					t.Fatal(protowire.ParseError(n))
+				}
+				if num == 21 && typ == protowire.BytesType {
+					_, _, tagLen := protowire.ConsumeTag(wire)
+					uid, _ := protowire.ConsumeString(wire[tagLen:n])
+					if uid != tc.wantUID {
+						t.Errorf("upstream model UID = %q, want %q", uid, tc.wantUID)
+					}
+					return
+				}
+				wire = wire[n:]
+			}
+			t.Fatal("upstream model UID is missing")
+		})
+	}
+}
+
 func TestDevinAuthCredentials(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Attributes: map[string]string{
@@ -138,6 +189,45 @@ func TestDevinExecutor_GetSensitiveWords(t *testing.T) {
 	words := eWithWords.getSensitiveWords()
 	if len(words) != 2 || words[0] != "sample-word-1" || words[1] != "sample-word-2" {
 		t.Errorf("words = %v, want [sample-word-1 sample-word-2]", words)
+	}
+}
+
+func TestDevinSensitiveWordsReplaceFromYAML(t *testing.T) {
+	cfg, errParse := config.ParseConfigBytes([]byte(`devin:
+  sensitive-words:
+    - "Codex"
+  sensitive-words-replace:
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+`))
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errParse)
+	}
+	e := NewDevinExecutor(cfg)
+	got := helps.SanitizeDevinSystemPrompt("You are Codex, an agent based on GPT-5.\nFollow project conventions.", e.getSensitiveWordMatcher())
+	want := "You are a helpful coding assistant.\nFollow project conventions."
+	if got != want {
+		t.Fatalf("SanitizeDevinSystemPrompt() = %q, want %q", got, want)
+	}
+}
+
+func TestDevinSensitivePatternsReplaceFromYAML(t *testing.T) {
+	cfg, errParse := config.ParseConfigBytes([]byte(`devin:
+  sensitive-words:
+    - "omp"
+  sensitive-patterns-replace:
+    - pattern: '(?m)^You are omp[^\n]*'
+      replacement: "You are a coding assistant."
+    - pattern: '(?s)<system[-_](conventions|directive)>.*?</system[-_](conventions|directive)>\n?'
+      replacement: ""
+`))
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errParse)
+	}
+	e := NewDevinExecutor(cfg)
+	got := helps.SanitizeDevinSystemPrompt("You are omp's assistant.\n<system-conventions>\nRFC 2119.\n</system-conventions>\nFollow project conventions.", e.getSensitiveWordMatcher())
+	want := "You are a coding assistant.\nFollow project conventions."
+	if got != want {
+		t.Fatalf("SanitizeDevinSystemPrompt() = %q, want %q", got, want)
 	}
 }
 
@@ -2154,6 +2244,56 @@ func TestDevinExecutor_ResponsesToolsFilterAndObfuscate(t *testing.T) {
 	}
 }
 
+func TestDevinExecutor_PrepareDevinHTTPRequest_ObfuscatesCodeModeExecDescription(t *testing.T) {
+	responsesPayload := []byte(`{
+		"model": "devin/claude-opus-5-5",
+		"tools": [
+			{
+				"type": "custom",
+				"name": "exec",
+				"description": "Run JavaScript code to orchestrate/compose tool calls\n### exec_command\nRuns a command in a PTY, returning output or a session ID for ongoing interaction.\n### write_stdin\nWrites characters to an existing unified exec session and returns recent output.\n"
+			}
+		],
+		"input": "Reply with exactly: OK"
+	}`)
+
+	exec := NewDevinExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key": "test-session-token",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "devin/claude-opus-5-5",
+		Payload: responsesPayload,
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: responsesPayload,
+	}
+
+	httpReq, _, logBody, errPrep := exec.prepareDevinHTTPRequest(context.Background(), auth, req, opts)
+	if errPrep != nil {
+		t.Fatalf("prepareDevinHTTPRequest failed: %v", errPrep)
+	}
+	bodyBytes, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+	flag, wireBytes, errUnwrap := helps.ReadConnectFrame(bytes.NewReader(bodyBytes))
+	if errUnwrap != nil || flag != 0 {
+		t.Fatalf("unwrap connect frame: flag=%d err=%v", flag, errUnwrap)
+	}
+	for label, raw := range map[string]string{"wire": string(wireBytes), "log": string(logBody)} {
+		if strings.Contains(raw, "a session ID") || strings.Contains(raw, "to an existing unified") {
+			t.Fatalf("%s still contains unsanitized exec_command/write_stdin phrase: %s", label, raw)
+		}
+		if !strings.Contains(raw, "an session ID") || !strings.Contains(raw, "to a existing unified") {
+			t.Fatalf("%s missing obfuscated exec_command/write_stdin phrase: %s", label, raw)
+		}
+	}
+}
+
 func TestDevinExecutor_ToolResultImagesInInteractionsPayload(t *testing.T) {
 	interactionsJSON := []byte(`{
 		"model": "devin/swe-2",
@@ -3146,8 +3286,9 @@ func TestRegressionIssue5910_UsageStatsCacheWriteTokensInResponses(t *testing.T)
 	}
 
 	root := ojson.ParseBytes(interactionsJSON)
-	if root.Get("usage.total_input_tokens").Int() != 53 {
-		t.Errorf("usage.total_input_tokens = %d, want 53", root.Get("usage.total_input_tokens").Int())
+	// total input = uncached 3 + cache read 50 + cache write 14361
+	if root.Get("usage.total_input_tokens").Int() != 14414 {
+		t.Errorf("usage.total_input_tokens = %d, want 14414", root.Get("usage.total_input_tokens").Int())
 	}
 	if root.Get("usage.cache_write_tokens").Int() != 14361 {
 		t.Errorf("usage.cache_write_tokens = %d, want 14361", root.Get("usage.cache_write_tokens").Int())
@@ -3156,8 +3297,11 @@ func TestRegressionIssue5910_UsageStatsCacheWriteTokensInResponses(t *testing.T)
 	if detail.CacheCreationTokens != 14361 {
 		t.Errorf("ParseInteractionsUsage CacheCreationTokens = %d, want 14361", detail.CacheCreationTokens)
 	}
-	if detail.InputTokens != 53 {
-		t.Errorf("ParseInteractionsUsage InputTokens = %d, want 53", detail.InputTokens)
+	if detail.InputTokens != 14414 {
+		t.Errorf("ParseInteractionsUsage InputTokens = %d, want 14414", detail.InputTokens)
+	}
+	if detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete || detail.TokenBreakdown.Input.UncachedTokens != 3 {
+		t.Errorf("token breakdown = %+v, want complete with 3 uncached", detail.TokenBreakdown)
 	}
 
 	// 2. Streaming test
@@ -3215,8 +3359,11 @@ func TestRegressionIssue5910_UsageStatsCacheWriteTokensInResponses(t *testing.T)
 	if sDetail.CacheCreationTokens != 14361 {
 		t.Errorf("ParseInteractionsStreamUsage CacheCreationTokens = %d, want 14361", sDetail.CacheCreationTokens)
 	}
-	if sDetail.InputTokens != 53 {
-		t.Errorf("ParseInteractionsStreamUsage InputTokens = %d, want 53", sDetail.InputTokens)
+	if sDetail.InputTokens != 14414 {
+		t.Errorf("ParseInteractionsStreamUsage InputTokens = %d, want 14414", sDetail.InputTokens)
+	}
+	if got := cRoot.Get("interaction.usage.total_input_tokens").Int(); got != 14414 {
+		t.Errorf("interaction.usage.total_input_tokens = %d, want 14414", got)
 	}
 }
 
